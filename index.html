@@ -600,6 +600,9 @@
 
   /* translation settings */
   .app-modal .modal-card.tu-card{ width:min(980px, 100%); }
+  .app-modal .modal-card.fasta-card{ width:min(760px, 100%); }
+  .fa-preview{ width:100%; box-sizing:border-box; height:220px; margin:8px 0; font-size:11.5px; }
+  .fa-range{ display:inline-flex; gap:12px; margin-top:2px; } .fa-range label{ display:inline-flex; gap:4px; align-items:center; }
   .tu-table{ width:100%; border-collapse:collapse; font-size:12.5px; margin:6px 0; }
   .tu-table th{ text-align:left; font-weight:600; color:var(--muted); font-size:11px; padding:4px 6px; border-bottom:1px solid var(--border); }
   .tu-table td{ padding:6px; border-bottom:1px solid var(--border); vertical-align:top; }
@@ -3386,7 +3389,10 @@
         el.refStatus.textContent = `${file.name} から配列を読み取れませんでした(GenBank / FASTA / EMBL に対応)。`;
         return;
       }
-      if (!parsed.name || parsed.name === 'reference') parsed.name = file.name.replace(/\.[^.]+$/, '');
+      // the file name is what people recognise; ApE / SnapGene often leave a
+      // placeholder such as "New_DNA" on the LOCUS line
+      const base = file.name.replace(/\.[^.]+$/, '');
+      if (base) parsed.name = base;
       if (applyReference(parsed)) {
         el.refInput.value = '>' + parsed.name + (parsed.description ? ' ' + parsed.description : '') + '\n' + wrap(parsed.seq);
       }
@@ -3463,10 +3469,7 @@
     render();
   });
 
-  el.exportBtn.addEventListener('click', () => {
-    el.exportPanel.hidden = !el.exportPanel.hidden;
-    if (!el.exportPanel.hidden) buildFasta();
-  });
+  el.exportBtn.addEventListener('click', () => openFastaDialog());
 
   el.copyFastaBtn.addEventListener('click', async () => {
     try {
@@ -6192,7 +6195,7 @@
     newProject, openProject: () => el.projectFileInput.click(), saveProject: saveProjectFile,
     addFiles: () => el.fileInput.click(),
     clearReads,
-    exportFasta: () => { if (reads.length === 0) { alert('書き出すリードがありません。'); return; } el.exportPanel.hidden = false; buildFasta(); el.exportPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); },
+    exportFasta: () => { if (reads.length === 0) { alert('書き出すリードがありません。'); return; } openFastaDialog(); },
     exportPdf: exportPdfReport,
     undo, redo,
     modeDenovo: () => setMode('denovo'), modeReference: () => setMode('reference'),
@@ -6722,7 +6725,7 @@
   // App chrome (ver.16): toolbar, settings popover, reference strip,
   // drag & drop, status bar, help, shortcuts, unsaved-changes warning.
   // =====================================================================
-  const APP_VERSION = 'ver.19';
+  const APP_VERSION = 'ver.20';
 
   function setAlignLabel() {
     el.alignLabel.textContent = mode === 'reference' ? 'リファレンスと比較' : 'コンティグを作成';
@@ -6772,6 +6775,93 @@
   el.refInput.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); el.refApplyBtn.click(); }
   });
+
+
+  // ---------- FASTA export dialog ----------
+  let fastaOpts = { scope: 'one', ref: true, refRange: 'region', sample: true, full: false, reads: false };
+  function fastaExportText(o) {
+    const out = [];
+    const add = (header, seq) => { if (seq) out.push(header + '\n' + wrap(seq)); };
+    const names = batchOn ? (o.scope === 'all' ? sampleNames().slice().sort((x, y) => String(x).localeCompare(String(y), 'ja', { numeric: true })) : [activeSample]) : [null];
+    // several samples cover different stretches: then the reference goes in once, full length
+    const refFull = o.ref && (o.refRange === 'full' || names.length > 1);
+    if (mode === 'reference' && refFull && referenceSeq) add(`>${fastaName(referenceName || 'reference')} region=1..${referenceSeq.length} reference`, referenceSeq);
+    names.forEach(name => {
+      const work = () => {
+        if (!contig && activeReads().length) runAlign();
+        if (mode === 'reference') {
+          if (o.ref || o.sample) {
+            // per-sample region pair; the reference once only when several samples share it
+            const recs = contig ? sampleFastaRecords(name, { noReference: !(o.ref && !refFull) }) : [];
+            recs.forEach(r => { if (/ reference$/.test(r.header) || o.sample) add(r.header, r.seq); });
+          }
+        } else {
+          if (o.sample && contig) sampleFastaRecords(name).forEach(r => add(r.header, r.seq));
+          if (o.full) {
+            const denovo = getDenovoConsensus();
+            if (denovo) {
+              const spans = (contig.groups && contig.groups.length > 1) ? contig.groups : [{ firstCol: 0, lastCol: contig.columns - 1 }];
+              spans.forEach((sp, gi) => add(`>${fastaName(sampleLabel(name))}${spans.length > 1 ? '_contig' + (gi + 1) : ''} consensus_untrimmed`, denovo.consensusString.slice(sp.firstCol, sp.lastCol + 1).replace(/-/g, '')));
+            }
+          }
+        }
+        if (o.reads) {
+          const ordered = contig ? contig.order.map(id => reads.find(r => r.id === id)).filter(Boolean) : activeReads();
+          ordered.forEach(r => add(`>${fastaName(r.filename)}${r.manualFlip ? ' reverse_complement' : ''}`, effectiveRow(r.id).replace(/-/g, '')));
+        }
+      };
+      if (batchOn) withSampleActive(name, work); else work();
+    });
+    return out.join('\n') + (out.length ? '\n' : '');
+  }
+  function openFastaDialog() {
+    if (reads.length === 0) return;
+    const multi = batchOn && sampleNames().length > 1;
+    const isRef = mode === 'reference';
+    document.querySelectorAll('.app-modal').forEach(n => n.remove());
+    const m = document.createElement('div');
+    m.className = 'app-modal';
+    const chk = (k, label, hint) => `<label class="rep-opt"><input type="checkbox" data-o="${k}" ${fastaOpts[k] ? 'checked' : ''}/> <span>${label}${hint ? `<small>${hint}</small>` : ''}</span></label>`;
+    m.innerHTML = `<div class="modal-card fasta-card" role="dialog" aria-label="FASTA 書き出し">
+      <div class="eyebrow">FASTA 書き出し</div><h2>書き出す配列</h2>
+      ${multi ? `<div class="rep-opts"><label class="rep-opt"><input type="radio" name="faScope" value="one" ${fastaOpts.scope !== 'all' ? 'checked' : ''}/> <span>表示中のサンプル(${esc(activeSample)})</span></label>
+        <label class="rep-opt"><input type="radio" name="faScope" value="all" ${fastaOpts.scope === 'all' ? 'checked' : ''}/> <span>全サンプル(${sampleNames().length})</span></label></div>` : ''}
+      <div class="rep-opts">
+        ${isRef ? chk('ref', 'リファレンス', `<span class="fa-range"><label><input type="radio" name="faRange" value="region" ${fastaOpts.refRange !== 'full' ? 'checked' : ''}> サンプルと同じ範囲</label> <label><input type="radio" name="faRange" value="full" ${fastaOpts.refRange === 'full' ? 'checked' : ''}> 全長</label></span>${multi ? '<br>全サンプルを選んだときは、全長を1本だけ入れます' : ''}`) : ''}
+        ${chk('sample', isRef ? 'サンプルの判定配列' : '信頼できる配列', isRef ? '一致はリファレンスの塩基、違いは読めた塩基。未確定は N、二重ピークは IUPAC 記号' : '両端の不確かな部分を除き、未確定は N、二重ピークは IUPAC 記号')}
+        ${isRef ? '' : chk('full', 'コンセンサス全長(トリム前)', '多数決のまま。端の質の低い部分も含みます')}
+        ${chk('reads', '各リード', 'トリム・手動修正・向きを反映した配列')}
+      </div>
+      <textarea class="fasta fa-preview" readonly spellcheck="false"></textarea>
+      <div class="fasta-actions"><button type="button" class="primary" id="faDownload">ダウンロード</button><button type="button" id="faCopy">コピー</button><button type="button" data-x>閉じる</button><span class="blast-msg" id="faMsg"></span></div>
+    </div>`;
+    document.body.appendChild(m);
+    const ta = m.querySelector('.fa-preview'), msg = m.querySelector('#faMsg');
+    const refresh = () => {
+      m.querySelectorAll('[data-o]').forEach(c => { fastaOpts[c.dataset.o] = c.checked; });
+      const sc = m.querySelector('input[name="faScope"]:checked'); fastaOpts.scope = sc ? sc.value : 'one';
+      const rr = m.querySelector('input[name="faRange"]:checked'); if (rr) fastaOpts.refRange = rr.value;
+      ta.value = fastaExportText(Object.assign({}, fastaOpts, { scope: multi ? fastaOpts.scope : 'one' }));
+      const n = (ta.value.match(/^>/mg) || []).length;
+      msg.textContent = n ? `${n} 本の配列` : '書き出す配列がありません';
+      m.querySelector('#faDownload').disabled = m.querySelector('#faCopy').disabled = !n;
+    };
+    m.addEventListener('change', refresh);
+    const fileName = () => {
+      const day = new Date().toISOString().slice(0, 10);
+      const who = multi && fastaOpts.scope === 'all' ? `${sampleNames().length}samples` : sampleLabel(batchOn ? activeSample : null);
+      return `ContigBench_${String(who).replace(/[\\/:*?"<>|\s]+/g, '_')}_${day}.fasta`;
+    };
+    m.querySelector('#faDownload').addEventListener('click', () => { downloadBlob(fileName(), new Blob([ta.value], { type: 'text/plain' })); msg.textContent = `${fileName()} を保存しました`; });
+    m.querySelector('#faCopy').addEventListener('click', () => copyText(ta.value).then(ok => { msg.textContent = ok ? 'コピーしました' : 'コピーできませんでした(欄を選んで Ctrl+C してください)'; }));
+    const close = () => { m.remove(); document.removeEventListener('keydown', onKey); };
+    const onKey = (e) => { if (e.key === 'Escape') close(); };
+    document.addEventListener('keydown', onKey);
+    m.addEventListener('click', (e) => { if (e.target === m) close(); });
+    m.querySelector('[data-x]').addEventListener('click', close);
+    refresh();
+    m.querySelector('#faDownload').focus();
+  }
 
   // ---------- translation settings dialog ----------
   // Works on a copy of the list; "適用" commits it as one undoable step.
