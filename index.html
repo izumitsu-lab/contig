@@ -638,6 +638,16 @@
     @bottom-left{ content:"ContigBench 解析レポート"; font:8.5pt "IBM Plex Sans", sans-serif; color:#8a948d; }
     @bottom-right{ content:counter(page) " / " counter(pages); font:8.5pt "IBM Plex Mono", monospace; color:#8a948d; }
   }
+  /* No room in the top margin = no browser header (print date / time and
+     page title), even when "ヘッダーとフッター" is ticked in the print dialog.
+     The report's own top space is padding repeated on every page instead.
+     Browsers that can't repeat padding per page keep the normal margin. */
+  @supports (box-decoration-break: clone){
+    @page{ margin-top:0; }
+    @media print{
+      #printReport{ padding-top:14mm !important; box-decoration-break:clone; -webkit-box-decoration-break:clone; }
+    }
+  }
   @media print{
     html, body{ background:#fff !important; }
     body{ padding:0 !important; margin:0 !important; }
@@ -6725,7 +6735,7 @@
   // App chrome (ver.16): toolbar, settings popover, reference strip,
   // drag & drop, status bar, help, shortcuts, unsaved-changes warning.
   // =====================================================================
-  const APP_VERSION = 'ver.20';
+  const APP_VERSION = 'ver.21';
 
   function setAlignLabel() {
     el.alignLabel.textContent = mode === 'reference' ? 'リファレンスと比較' : 'コンティグを作成';
