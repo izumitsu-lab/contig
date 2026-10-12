@@ -706,6 +706,10 @@
   .print-report .b.gap10{ margin-right:3px; }
   .print-report .b.ins::after, .print-report .b.insck::after{ right:-2px; width:2px; }
   section.rep-sample{ margin-top:6px; }
+  .rep-fasta-rec{ break-inside:avoid; page-break-inside:avoid; margin:4px 0 10px; }
+  .rep-fasta-note{ font-size:8pt; color:var(--muted); margin-bottom:2px; }
+  pre.rep-fasta{ font-family:"IBM Plex Mono", "Courier New", monospace; font-size:8pt; line-height:1.3; letter-spacing:0; white-space:pre; overflow:hidden;
+    margin:0; padding:6px 8px; border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:4px; background:#fafbf8; color:var(--ink); }
   section.rep-sample.rep-newpage{ break-before:page; page-break-before:always; }
   .rep-foot{ margin-top:14px; padding-top:5px; border-top:1px solid var(--border); font-size:7.5pt; color:var(--muted); }
   /* report dialog */
@@ -3670,6 +3674,8 @@
     const refView = getReferenceView();
     if (refView) {
       out += '>reference\n' + wrap(referenceSeq) + '\n'; // in its own numbering, even when shown rotated
+      const smp = sampleFastaRecords(batchOn ? activeSample : null, { noReference: true })[0];
+      if (smp) out += smp.header + '\n' + wrap(smp.seq) + '\n';
     } else if (denovo) {
       const spans = (contig.groups && contig.groups.length > 1) ? contig.groups : [{ firstCol: 0, lastCol: contig.columns - 1 }];
       spans.forEach((sp, gi) => {
@@ -6255,7 +6261,83 @@
   const REP_MAX_FIGS = 30;   // excerpts per sample
   const REP_DPR = 2;         // render excerpts at 2x for print sharpness
 
-  let reportOpts = { all: true, map: true, figs: true, seq: true };
+  let reportOpts = { all: true, map: true, figs: true, seq: true, fasta: true };
+
+  // ---- FASTA records for the report (and the FASTA export) ----
+  // Reference mode: the sample's judged sequence over the stretch its reads
+  // cover -- matches take the reference base, differences the called base
+  // (deletions dropped, insertions added), unsettled bases N, double peaks
+  // their IUPAC code, gaps between reads N -- paired with the reference over
+  // the same stretch so the two can go straight into a pairwise aligner.
+  function fastaName(n) { return String(n == null ? 'sample' : n).trim().replace(/\s+/g, '_').replace(/^>+/, '').slice(0, 60) || 'sample'; }
+  function sampleLabel(name) {
+    if (name != null) return name;
+    const r = contig ? reads.find(x => x.id === contig.order[0]) : reads[0];
+    return r ? guessSampleName(r.filename) : 'sample';
+  }
+  function referenceSampleSequence(s, refView) {
+    const row = refView.refRow;
+    const positions = Contig.referenceColumnPositions(row);
+    const order = [];
+    for (let c = 0; c < row.length; c++) if (row[c] !== '-') order.push(refView.toOrig(positions[c]));
+    let a = -1, b = -1;
+    order.forEach((p, i) => { if (s.bases[p - 1] && s.bases[p - 1].status !== 'nocov') { if (a < 0) a = i; b = i; } });
+    if (a < 0) return null;
+    const insAt = new Map();
+    s.events.forEach(ev => { if (ev.kind === 'ins') insAt.set(ev.start, ev); });
+    let ref = '', seq = '', nN = 0, nIupac = 0, unsureIns = 0, gaps = 0;
+    for (let i = a; i <= b; i++) {
+      const p = order[i], cell = s.bases[p - 1];
+      ref += cell.ref;
+      if (cell.status === 'match') seq += cell.ref;
+      else if (cell.status === 'diff') seq += cell.call === '-' ? '' : cell.call;
+      else if (cell.status === 'het') { seq += cell.call || 'N'; nIupac++; }
+      else { seq += 'N'; if (cell.status === 'nocov') gaps++; else nN++; }
+      const ev = insAt.get(p);
+      if (ev && i < b) { if (ev.status === 'diff') seq += ev.call.replace(/[^ACGTN]/g, ''); else unsureIns++; }
+    }
+    const from = order[a], to = order[b];
+    const region = from <= to ? `${from}..${to}` : `${from}..${s.refLen},1..${to}`;
+    return { ref, seq, from, to, region, nN, nIupac, unsureIns, gaps };
+  }
+  function wrapSeq(seq, n) { const out = []; for (let i = 0; i < seq.length; i += n) out.push(seq.slice(i, i + n)); return out.join('\n'); }
+
+  // records of the active sample: [{header, seq, note}]
+  function sampleFastaRecords(name, opts) {
+    opts = opts || {};
+    if (!contig) return [];
+    const label = fastaName(sampleLabel(name));
+    if (mode === 'reference') {
+      const refView = getReferenceView();
+      if (!refView) return [];
+      const s = computeReferenceSummary(refView);
+      const x = referenceSampleSequence(s, refView);
+      if (!x) return [];
+      const recs = [];
+      if (!opts.noReference) recs.push({ header: `>${fastaName(referenceName || 'reference')} region=${x.region} reference`, seq: x.ref, note: `リファレンス(サンプルと同じ範囲・${x.ref.length.toLocaleString()} bp)` });
+      const bits = [`違い ${s.diffEvents.length}`];
+      if (x.nN) bits.push(`未確定の塩基を N に ${x.nN}`);
+      if (x.gaps) bits.push(`リードが届かない所を N に ${x.gaps}`);
+      if (x.nIupac) bits.push(`二重ピークを IUPAC 記号に ${x.nIupac}`);
+      if (x.unsureIns) bits.push(`要確認の挿入 ${x.unsureIns} 箇所は含めていません`);
+      recs.push({ header: `>${label} region=${x.region} consensus`, seq: x.seq, note: `${esc(sampleLabel(name))} の判定配列(${x.seq.length.toLocaleString()} bp・${contig.order.length} リード・${bits.join('・')})` });
+      return recs;
+    }
+    const d = computeDenovoReliable();
+    if (!d) return [];
+    const parts = [d].concat(d.others || []);
+    return parts.filter(pt => pt.kept.length).map((pt, i) => {
+      const seq = pt.kept.map(dnOutBase).join('');
+      const nN = (seq.match(/N/g) || []).length, nI = (seq.match(/[RYSWKMBDHV]/g) || []).length;
+      const tag = parts.length > 1 ? `_contig${i + 1}` : '';
+      return { header: `>${label}${tag} length=${seq.length} reliable_Q${d.T}`, seq,
+        note: `${esc(sampleLabel(name))}${parts.length > 1 ? ` コンティグ ${i + 1}` : ''} の信頼できる配列(${seq.length.toLocaleString()} bp${nN ? `・未確定を N に ${nN}` : ''}${nI ? `・二重ピークを IUPAC 記号に ${nI}` : ''})` };
+    });
+  }
+  function fastaBlockHtml(recs) {
+    return recs.map(r => `<div class="rep-fasta-rec"><div class="rep-fasta-note">${r.note}</div><pre class="rep-fasta">${esc(r.header)}\n${esc(wrapSeq(r.seq, 80))}</pre></div>`).join('');
+  }
+  const REP_FASTA_HINT = 'PDF の中の文字をそのまま選んでコピーできます。「&gt;」の行から配列の最後の行までを選んで、BLAST や配列ソフトに貼り付けてください(改行が入っていても FASTA として読めます)。';
 
   function reportFileName(all) {
     const day = new Date().toISOString().slice(0, 10);
@@ -6278,6 +6360,7 @@
         ${chk('figs', '違い・要確認の箇所の波形', '前後 20 塩基を、その位置を読んだリードすべてについて載せます')}
         ${mode === 'reference' ? chk('map', '全長マップ', 'リードが読めた範囲と違いの位置の図') : ''}
         ${chk('seq', mode === 'reference' ? 'リファレンス全長の判定配列' : 'コンセンサス配列(全長)', '1行 60 塩基・色分けつき')}
+        ${chk('fasta', 'FASTA(コピー用の配列)', mode === 'reference' ? 'リファレンスとサンプルの判定配列を、PDF から選んでそのままコピーできる形で載せます' : '信頼できる配列を、PDF から選んでそのままコピーできる形で載せます')}
       </div>
       <p class="pop-hint">「印刷画面を開く」を押すと印刷画面が出ます。送信先(プリンター)を「PDF に保存」にすると PDF になります。ファイル名は「${esc(reportFileName(multi ? reportOpts.all : false))}.pdf」が提案されます。</p>
       <div class="fasta-actions"><button type="button" class="primary" id="reportGo">印刷画面を開く</button><button type="button" data-x>キャンセル</button><span class="blast-msg" id="reportMsg"></span></div>
@@ -6320,13 +6403,32 @@
     try {
       let html = reportHeaderHtml(o);
       const names = batchOn ? (o.all ? sampleNames() : [activeSample]) : [null];
+      const fastaAll = [];
       if (batchOn && o.all) html += batchSummaryReportHtml();
       names.forEach((name, i) => {
+        const appendix = batchOn && o.all && names.length > 1;
+        const one = () => {
+          let b = sampleReportHtml(name, o);
+          if (o.fasta) {
+            const recs = sampleFastaRecords(name, { noReference: appendix });
+            if (appendix) fastaAll.push(...recs);
+            else if (recs.length) b += `<h3>FASTA(コピー用)<small>${REP_FASTA_HINT}</small></h3>${fastaBlockHtml(recs)}`;
+          }
+          return b;
+        };
         const body = batchOn
-          ? withSampleActive(name, () => { if (!contig) runAlign(); judgeActiveSample(); return sampleReportHtml(name, o); })
-          : sampleReportHtml(null, o);
+          ? withSampleActive(name, () => { if (!contig) runAlign(); judgeActiveSample(); return one(); })
+          : one();
         html += `<section class="rep-sample${(i > 0 || (batchOn && o.all)) ? ' rep-newpage' : ''}">${body}</section>`;
       });
+      // several samples: all sequences together at the end, ready to paste
+      // into an alignment program in one go
+      if (fastaAll.length) {
+        const refRec = mode === 'reference' && referenceSeq
+          ? [{ header: `>${fastaName(referenceName || 'reference')} region=1..${referenceSeq.length} reference`, seq: referenceSeq, note: `リファレンス全長(${referenceSeq.length.toLocaleString()} bp)` }] : [];
+        html += `<section class="rep-sample rep-newpage"><h2 class="rep-h2">付録: FASTA(コピー用)</h2>
+          <p class="rep-lead">${REP_FASTA_HINT}${mode === 'reference' ? '各サンプルの配列は、リードが読めた範囲(見出しの region=)だけです。' : ''}</p>${fastaBlockHtml(refRec.concat(fastaAll))}</section>`;
+      }
       html += `<p class="rep-foot">ContigBench ${APP_VERSION} で作成。ファイルはブラウザ内だけで処理しています。判定は重なったリードの品質値(Phred)を合算して比べたもので、最終確認は波形で行ってください。</p>`;
       return html;
     } finally {
@@ -6620,7 +6722,7 @@
   // App chrome (ver.16): toolbar, settings popover, reference strip,
   // drag & drop, status bar, help, shortcuts, unsaved-changes warning.
   // =====================================================================
-  const APP_VERSION = 'ver.18';
+  const APP_VERSION = 'ver.19';
 
   function setAlignLabel() {
     el.alignLabel.textContent = mode === 'reference' ? 'リファレンスと比較' : 'コンティグを作成';
